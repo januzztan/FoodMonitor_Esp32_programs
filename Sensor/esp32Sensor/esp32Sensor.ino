@@ -1,5 +1,3 @@
-
-
 #define ENABLE_FIRESTORE
 
 #include <FirebaseClient.h>
@@ -23,19 +21,16 @@
 #define FIREBASE_SEND_INTERVAL 60000 // Send to Firebase every 1 minute
 #define WIFI_RECONNECT_INTERVAL 5000 // Try WiFi reconnect every 5 seconds
 #define MODBUS_RETRY_INTERVAL 5000   // Retry Modbus init every 5 seconds
-#define MAX_READING_ID_SEARCH 10000  // Maximum reading ID to search (prevents infinite loops)
-#define READING_ID_SEARCH_TIMEOUT 30000 // 30 seconds timeout for reading ID search
-#define MAX_UPLOAD_RETRIES 5         // Maximum number of upload retry attempts (more aggressive)
-#define UPLOAD_RETRY_DELAY 3000      // Delay between upload retries (3 seconds - more aggressive)
+#define MAX_UPLOAD_RETRIES 5         // Maximum number of upload retry attempts
+#define UPLOAD_RETRY_DELAY 3000      // Delay between upload retries (3 seconds)
 
 // Function declarations
 void processFirebaseData(AsyncResult &aResult);
-void processReadingCheckData(AsyncResult &aResult);
 void readModbusSensors();
 void sendSensorDataToFirebase();
-void findNextAvailableReadingId();
 String getCurrentTimestamp();
 String getCurrentDateTime();
+String generateRandomDocumentId();
 bool validateConfiguration();
 bool initializeModbus();
 bool initializeWiFi();
@@ -51,7 +46,6 @@ NoAuth no_auth;
 FirebaseApp app;
 Firestore::Documents Docs;
 AsyncResult firestoreResult;
-AsyncResult readingCheckResult;
 
 // Modbus object
 ModbusMaster node;
@@ -72,28 +66,25 @@ unsigned long lastSensorRead = 0;
 unsigned long lastFirebaseSend = 0;
 unsigned long lastWiFiCheck = 0;
 unsigned long lastModbusRetry = 0;
-unsigned long readingIdSearchStart = 0;
-int currentReadingId = 0;        // Current ID we're checking
-int nextReadingId = -1;          // -1 means not found yet
 bool configValid = false;
 bool modbusInitialized = false;
 bool wifiInitialized = false;
 bool ntpInitialized = false;
-bool readingIdFound = false;
-bool waitingForReadingCheck = false;
 bool waitingForUpload = false;
-bool searchingForNextId = false;
 bool firebaseInitialized = false;
-int uploadRetryCount = 0;             // Current retry attempt count
-unsigned long lastUploadRetry = 0;    // Timestamp of last retry attempt
-bool firstUploadDone = false;         // Track if first upload has been completed
+int uploadRetryCount = 0;
+unsigned long lastUploadRetry = 0;
+bool firstUploadDone = false;
 
 void setup()
 {
     Serial.begin(115200);
     delay(2000);
     
-    Serial.println("=== Modbus Sensor to Firebase (Auto-increment) ===");
+    Serial.println("=== Modbus Sensor to Firebase (Random IDs) ===");
+    
+    // Initialize random seed
+    randomSeed(analogRead(0) + millis());
     
     // Validate configuration
     configValid = validateConfiguration();
@@ -123,7 +114,6 @@ void setup()
             // Initialize timing variables properly
             lastSensorRead = millis();
             lastFirebaseSend = millis();
-            readingIdSearchStart = millis();
         }
     }
 }
@@ -174,22 +164,6 @@ void loop()
         }
     }
     
-    // Find next available reading ID if not found yet
-    if (firebaseInitialized && app.ready() && !readingIdFound && !waitingForReadingCheck && !searchingForNextId) {
-        debugPrint("Starting search for next available reading ID...");
-        findNextAvailableReadingId();
-    }
-    
-    // Handle reading ID search timeout
-    if (searchingForNextId && (millis() - readingIdSearchStart) > READING_ID_SEARCH_TIMEOUT) {
-        debugPrint("Reading ID search timeout - using fallback method");
-        nextReadingId = random(1000, 9999); // Use random ID as fallback
-        readingIdFound = true;
-        searchingForNextId = false;
-        waitingForReadingCheck = false;
-        Serial.printf("Using fallback reading ID: %d\n", nextReadingId);
-    }
-    
     // Read sensors every 10 seconds
     if (millis() - lastSensorRead >= SENSOR_READ_INTERVAL) {
         readModbusSensors();
@@ -201,19 +175,17 @@ void loop()
         debugPrint("=== Current State ===");
         debugPrint("Firebase ready: " + String(app.ready() ? "YES" : "NO"));
         debugPrint("Sensor data valid: " + String(currentSensorData.isValid ? "YES" : "NO"));
-        debugPrint("Reading ID found: " + String(readingIdFound ? "YES" : "NO"));
-        debugPrint("Next reading ID: " + String(nextReadingId));
         debugPrint("Waiting for upload: " + String(waitingForUpload ? "YES" : "NO"));
         debugPrint("Time since last Firebase send: " + String(millis() - lastFirebaseSend) + "ms");
         debugPrint("==================");
     }
     
-    // Send data to Firebase every 1 minute (only if we have valid sensor data and reading ID)
+    // Send data to Firebase every 1 minute (only if we have valid sensor data)
     // For the first upload, skip the timer check to upload immediately
     bool timeConditionMet = firstUploadDone ? (millis() - lastFirebaseSend >= FIREBASE_SEND_INTERVAL) : true;
     
-    if (firebaseInitialized && app.ready() && currentSensorData.isValid && readingIdFound && 
-        nextReadingId >= 0 && !waitingForUpload && timeConditionMet) {
+    if (firebaseInitialized && app.ready() && currentSensorData.isValid && 
+        !waitingForUpload && timeConditionMet) {
         
         debugPrint("All conditions met - attempting Firebase upload...");
         uploadRetryCount = 0; // Reset retry count for new upload
@@ -222,7 +194,6 @@ void loop()
             Serial.println("Starting first upload (no delay)");
         }
         
-        Serial.printf("Uploading reading_%d...\n", nextReadingId);
         sendSensorDataToFirebase();
         lastFirebaseSend = millis();
     }
@@ -237,7 +208,6 @@ void loop()
     
     // Process Firebase responses
     processFirebaseData(firestoreResult);
-    processReadingCheckData(readingCheckResult);
     
     delay(100);
 }
@@ -304,24 +274,6 @@ void setupNTP()
     }
 }
 
-void findNextAvailableReadingId()
-{
-    if (searchingForNextId) {
-        return; // Already searching
-    }
-    
-    debugPrint("Checking if reading_" + String(currentReadingId) + " exists...");
-    searchingForNextId = true;
-    waitingForReadingCheck = true;
-    readingIdSearchStart = millis();
-    
-    // Check if document exists
-    String documentPath = "sensor_data/reading_";
-    documentPath += currentReadingId;
-    
-    Docs.get(aClient, Firestore::Parent(FIREBASE_PROJECT_ID), documentPath, GetDocumentOptions(), readingCheckResult);
-}
-
 void readModbusSensors()
 {
     debugPrint("Reading Modbus sensors...");
@@ -366,34 +318,54 @@ void readModbusSensors()
     }
 }
 
+String generateRandomDocumentId()
+{
+    // Generate a random alphanumeric string
+    String chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    String randomId = "";
+    
+    // Create a 16-character random string
+    for (int i = 0; i < 16; i++) {
+        randomId += chars[random(chars.length())];
+    }
+    
+    // Add timestamp for additional uniqueness
+    randomId += "_" + String(millis());
+    
+    return randomId;
+}
+
 void sendSensorDataToFirebase()
 {
-    debugPrint("Attempting to upload to Firebase...");
+    Serial.println("=== FIREBASE UPLOAD ATTEMPT ===");
+    Serial.printf("Temperature: %.1f°C\n", currentSensorData.temperature);
+    Serial.printf("Humidity: %.1f%%\n", currentSensorData.humidity);
+    Serial.printf("Pressure: %.1f hPa\n", currentSensorData.pressure);
+    Serial.printf("Firebase ready: %s\n", app.ready() ? "YES" : "NO");
     
-    // Show current retry status
     if (uploadRetryCount > 0) {
-        Serial.printf("Retry attempt %d/%d for reading_%d\n", 
-                     uploadRetryCount + 1, MAX_UPLOAD_RETRIES + 1, nextReadingId);
+        Serial.printf("Retry attempt: %d/%d\n", uploadRetryCount + 1, MAX_UPLOAD_RETRIES + 1);
     }
     
     waitingForUpload = true;
     
-    // Create document path: sensor_data/reading_X
-    String documentPath = "sensor_data/reading_";
-    documentPath += nextReadingId;
+    // Generate random document ID
+    String randomDocId = generateRandomDocumentId();
+    String documentPath = "sensor_data/" + randomDocId;
     
-    Serial.printf("Creating document: %s\n", documentPath.c_str());
+    Serial.printf("Document ID: %s\n", randomDocId.c_str());
+    Serial.printf("Document path: %s\n", documentPath.c_str());
     
-    // Create document with only the requested fields
+    // Create document with sensor data
     Document<Values::Value> doc("timestamp", Values::Value(Values::StringValue(getCurrentTimestamp())));
     doc.add("datetime", Values::Value(Values::StringValue(getCurrentDateTime())));
     doc.add("temperature", Values::Value(Values::DoubleValue(currentSensorData.temperature)));
     doc.add("humidity", Values::Value(Values::DoubleValue(currentSensorData.humidity)));
     doc.add("pressure", Values::Value(Values::DoubleValue(currentSensorData.pressure)));
     
-    // Send to Firebase
-    debugPrint("Sending document to Firebase...");
+    Serial.println("Sending to Firestore...");
     Docs.createDocument(aClient, Firestore::Parent(FIREBASE_PROJECT_ID), documentPath, DocumentMask(), doc, firestoreResult);
+    Serial.println("===============================");
 }
 
 void processFirebaseData(AsyncResult &aResult)
@@ -405,7 +377,6 @@ void processFirebaseData(AsyncResult &aResult)
         uploadRetryCount++;
         
         Serial.println("--- Upload Failed ---");
-        Serial.printf("Document: reading_%d\n", nextReadingId);
         Serial.printf("Attempt: %d\n", uploadRetryCount);
         Serial.printf("Error: %s (code: %d)\n", 
                       aResult.error().message().c_str(), 
@@ -427,7 +398,6 @@ void processFirebaseData(AsyncResult &aResult)
     
     if (aResult.available()) {
         Serial.println("--- Upload Success ---");
-        Serial.printf("Document: reading_%d\n", nextReadingId);
         
         if (uploadRetryCount > 0) {
             Serial.printf("Attempts: %d\n", uploadRetryCount + 1);
@@ -445,53 +415,9 @@ void processFirebaseData(AsyncResult &aResult)
         Serial.println("---------------------");
         Serial.println();
         
-        // Move to next reading ID for next upload
-        nextReadingId++;
-        
         // Reset retry counter on successful upload
         uploadRetryCount = 0;
         waitingForUpload = false;
-        aResult.clear();
-    }
-}
-
-void processReadingCheckData(AsyncResult &aResult)
-{
-    if (!aResult.isResult()) return;
-    
-    waitingForReadingCheck = false;
-    searchingForNextId = false;
-    
-    if (aResult.isError()) {
-        int errorCode = aResult.error().code();
-        if (errorCode == 404) {
-            // Document doesn't exist - this is our next available ID!
-            debugPrint("Found next available reading ID: " + String(currentReadingId));
-            nextReadingId = currentReadingId;
-            readingIdFound = true;
-        } else {
-            Serial.printf("Error checking reading_%d: %s (code: %d)\n", 
-                          currentReadingId, 
-                          aResult.error().message().c_str(), 
-                          aResult.error().code());
-            
-            // If we get an error that's not 404, wait and try again
-            delay(1000);
-        }
-        Serial.println();
-    } else if (aResult.available()) {
-        // Document exists, try the next ID
-        debugPrint("reading_" + String(currentReadingId) + " exists, checking next...");
-        currentReadingId++;
-        
-        // Safety check to prevent infinite loops
-        if (currentReadingId > MAX_READING_ID_SEARCH) {
-            Serial.println("Reached maximum reading ID search limit!");
-            Serial.printf("Using reading ID: %d\n", currentReadingId);
-            nextReadingId = currentReadingId;
-            readingIdFound = true;
-        }
-        
         aResult.clear();
     }
 }
